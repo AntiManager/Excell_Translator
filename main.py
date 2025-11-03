@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GUI приложение для перевода Excel файлов.
+GUI приложение для перевода Excell файлов.
 Улучшенная версия со стабильным переводчиком.
 """
 import tkinter as tk
@@ -263,7 +263,7 @@ class StatisticsDialog:
 class ExcelTranslatorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel Translator v3.0 - Улучшенная версия")
+        self.root.title("Excell Translator v3.0 - Улучшенная версия")
         self.root.geometry("1200x800")
         self.root.minsize(1000, 600)
         
@@ -306,7 +306,7 @@ class ExcelTranslatorGUI:
     def _setup_left_panel(self):
         """Настраивает левую панель управления"""
         # Выбор файла
-        file_frame = ttk.LabelFrame(self.left_frame, text="Файл Excel", padding="5")
+        file_frame = ttk.LabelFrame(self.left_frame, text="Файл Excell", padding="5")
         file_frame.pack(fill=tk.X, pady=(0, 10))
         
         self.file_var = tk.StringVar()
@@ -472,9 +472,9 @@ class ExcelTranslatorGUI:
                 self.tree.item(item, tags=('selected' if selected_cols else 'not_selected',))
     
     def select_file(self):
-        """Выбор файла Excel."""
+        """Выбор файла Excell."""
         file_path = filedialog.askopenfilename(
-            title="Выберите файл Excel",
+            title="Выберите файл Excell",
             filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
         )
         
@@ -639,7 +639,7 @@ class ExcelTranslatorGUI:
     def start_translation(self):
         """Запускает процесс перевода в отдельном потоке."""
         if not self.file_path:
-            messagebox.showwarning("Предупреждение", "Сначала выберите файл Excel")
+            messagebox.showwarning("Предупреждение", "Сначала выберите файл Excell")
             return
         
         has_selected = any(columns for columns in self.selected_sheets.values())
