@@ -1,16 +1,17 @@
-# [file name]: main.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 GUI приложение для перевода Excel файлов.
+Улучшенная версия со стабильным переводчиком.
 """
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 import threading
 import logging
 import sys
 import json
+import time
 from typing import Dict, List, Optional, Tuple
 
 # Добавляем путь для импорта translator
@@ -34,7 +35,6 @@ class ResizablePanedWindow(ttk.PanedWindow):
     
     def on_drag(self, event):
         if self.dragging:
-            # Обновляем разделитель при перетаскивании
             self.place_configure(x=event.x)
     
     def on_release(self, event):
@@ -126,7 +126,7 @@ class SheetPreviewDialog:
         # Создаем чекбоксы для всех колонок
         self.column_vars = {}
         for i, column in enumerate(self.columns):
-            var = tk.BooleanVar(value=True)  # По умолчанию все выбраны
+            var = tk.BooleanVar(value=True)
             self.column_vars[column] = var
             
             cb = ttk.Checkbutton(self.scrollable_frame, text=column, variable=var,
@@ -198,6 +198,66 @@ class SheetPreviewDialog:
         """Отменяет выбор"""
         self.selected_columns = []
         self.dialog.destroy()
+
+
+class StatisticsDialog:
+    """Диалог отображения статистики перевода"""
+    
+    def __init__(self, parent, stats: Dict):
+        self.parent = parent
+        self.stats = stats
+        self.dialog = None
+        
+    def show(self):
+        """Показывает диалог статистики"""
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title("Статистика перевода")
+        self.dialog.geometry("500x400")
+        self.dialog.transient(self.parent)
+        self.dialog.grab_set()
+        
+        main_frame = ttk.Frame(self.dialog, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(main_frame, text="Статистика перевода", 
+                 font=('Arial', 14, 'bold')).pack(pady=(0, 20))
+        
+        # Статистика
+        stats_text = scrolledtext.ScrolledText(main_frame, height=15, wrap=tk.WORD)
+        stats_text.pack(fill=tk.BOTH, expand=True)
+        
+        stats_str = self._format_stats()
+        stats_text.insert(tk.END, stats_str)
+        stats_text.config(state=tk.DISABLED)
+        
+        # Кнопка закрытия
+        ttk.Button(main_frame, text="Закрыть", 
+                  command=self.dialog.destroy).pack(pady=10)
+        
+        self.parent.wait_window(self.dialog)
+    
+    def _format_stats(self) -> str:
+        """Форматирует статистику для отображения"""
+        stats = self.stats
+        return f"""
+ОБЩАЯ СТАТИСТИКА:
+
+Производительность:
+• Всего переведено: {stats.get('translated', 0)}
+• Использовано из кэша: {stats.get('cached', 0)}
+• Всего запросов: {stats.get('total_requests', 0)}
+• Скорость: {stats.get('requests_per_second', 0):.1f} запросов/сек
+• Время работы: {stats.get('elapsed_time', 0):.1f} сек
+
+Ошибки и повторы:
+• Неудачных переводов: {stats.get('failed', 0)}
+• Повторных попыток: {stats.get('retries', 0)}
+• Размер кэша: {stats.get('cache_size', 0)} записей
+
+ЭФФЕКТИВНОСТЬ:
+• Эффективность кэша: {(stats.get('cached', 0) / max(1, stats.get('cached', 0) + stats.get('translated', 0)) * 100):.1f}%
+• Успешных переводов: {(stats.get('translated', 0) / max(1, stats.get('total_requests', 0)) * 100):.1f}%
+"""
 
 
 class ExcelTranslatorGUI:
@@ -329,6 +389,9 @@ class ExcelTranslatorGUI:
                                     command=self.resume_translation)
         self.resume_btn.pack(side=tk.LEFT, padx=2)
         
+        ttk.Button(btn_frame2, text="Статистика", 
+                  command=self.show_statistics).pack(side=tk.LEFT, padx=2)
+        
         ttk.Button(btn_frame2, text="Сбросить прогресс", 
                   command=self.reset_progress).pack(side=tk.LEFT, padx=2)
         
@@ -363,12 +426,8 @@ class ExcelTranslatorGUI:
         log_frame = ttk.LabelFrame(self.right_frame, text="Лог выполнения", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.log_text = tk.Text(log_frame, wrap=tk.WORD)
-        log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scrollbar.set)
-        
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
     
     def setup_logging(self):
         """Настраивает логирование в GUI."""
@@ -397,7 +456,6 @@ class ExcelTranslatorGUI:
             self.file_var.set(self.file_path)
             self.load_file_info()
             
-            # Восстанавливаем выбранные колонки
             if 'selected_sheets' in state:
                 self.selected_sheets = state['selected_sheets']
                 self._update_treeview_from_state()
@@ -435,18 +493,14 @@ class ExcelTranslatorGUI:
         self.root.update()
         
         try:
-            # Получаем информацию о листах и колонках
             self.sheet_info = self.translator.get_sheet_info(self.file_path)
             
-            # Получаем превью данных для каждого листа
             self.sheet_previews = {}
             for sheet_name in self.sheet_info.keys():
                 preview = self.translator.get_sheet_preview(self.file_path, sheet_name, preview_rows=10)
                 self.sheet_previews[sheet_name] = preview
             
             self.populate_treeview()
-            
-            # Оцениваем объем перевода
             self._estimate_translation_volume()
             
             self.status_var.set("Файл загружен успешно")
@@ -463,13 +517,12 @@ class ExcelTranslatorGUI:
         total_cells = 0
         for sheet_name, columns in self.selected_sheets.items():
             if sheet_name in self.sheet_previews and columns:
-                # Примерная оценка на основе превью
                 preview_data = self.sheet_previews[sheet_name]
                 if preview_data:
                     total_cells += len(preview_data) * len(columns)
         
         if total_cells > 0:
-            estimated_time = total_cells * 0.5  # Примерно 0.5 секунды на ячейку
+            estimated_time = total_cells * 0.3  # Улучшенная оценка времени
             self.volume_var.set(f"Объем: ~{total_cells} ячеек, время: ~{estimated_time/60:.1f} мин")
         else:
             self.volume_var.set("Объем: не оценен (выберите колонки)")
@@ -479,11 +532,9 @@ class ExcelTranslatorGUI:
         self.tree.delete(*self.tree.get_children())
         
         for sheet_name, columns in self.sheet_info.items():
-            # Используем сохраненные выбранные колонки или все по умолчанию
             selected_columns = self.selected_sheets.get(sheet_name, columns.copy())
             self.selected_sheets[sheet_name] = selected_columns
             
-            # Добавляем лист в treeview
             status = '✓ Выбран' if selected_columns else '✗ Не выбран'
             progress = self.state_manager.get_sheet_progress(sheet_name)
             
@@ -539,15 +590,13 @@ class ExcelTranslatorGUI:
             messagebox.showerror("Ошибка", f"Нет данных предпросмотра для листа '{sheet_name}'")
             return
         
-        # Создаем диалог с предпросмотром
         preview_data = self.sheet_previews[sheet_name]
         dialog = SheetPreviewDialog(self.root, sheet_name, self.sheet_info[sheet_name], preview_data)
         selected_columns = dialog.show()
         
-        if selected_columns:  # Если пользователь нажал "Применить"
+        if selected_columns:
             self.selected_sheets[sheet_name] = selected_columns
             
-            # Обновляем treeview
             status = '✓ Выбран' if selected_columns else '✗ Не выбран'
             self.tree.set(item, 'Status', status)
             self.tree.set(item, 'Columns', f'{len(selected_columns)} колонок')
@@ -558,12 +607,17 @@ class ExcelTranslatorGUI:
             
             logging.info(f"Настроены колонки для листа '{sheet_name}': выбрано {len(selected_columns)} колонок")
     
+    def show_statistics(self):
+        """Показывает диалог статистики"""
+        stats = self.translator.get_translation_stats()
+        dialog = StatisticsDialog(self.root, stats)
+        dialog.show()
+    
     def update_progress(self, sheet_name: str, progress: float, message: str):
         """Обновляет прогресс-бар и статус."""
         self.overall_progress_var.set(progress)
         self.status_var.set(message)
         
-        # Обновляем прогресс в treeview
         for item in self.tree.get_children():
             if self.tree.item(item, 'text') == sheet_name:
                 progress_text = f"{progress:.1f}%" if progress > 0 else ""
@@ -573,10 +627,8 @@ class ExcelTranslatorGUI:
                     self.tree.item(item, tags=('completed',))
                 elif progress > 0:
                     self.tree.item(item, tags=('in_progress',))
-                
                 break
         
-        # Обновляем детальный прогресс
         self.details_text.config(state=tk.NORMAL)
         self.details_text.insert(tk.END, f"{message}\n")
         self.details_text.see(tk.END)
@@ -590,19 +642,16 @@ class ExcelTranslatorGUI:
             messagebox.showwarning("Предупреждение", "Сначала выберите файл Excel")
             return
         
-        # Проверяем, есть ли выбранные листы с колонками
         has_selected = any(columns for columns in self.selected_sheets.values())
         if not has_selected:
             messagebox.showwarning("Предупреждение", "Выберите хотя бы один лист с колонками для перевода")
             return
         
-        # Создаем путь для выходного файла
         input_path = Path(self.file_path)
         output_path = input_path.parent / f"{input_path.stem}_ru{input_path.suffix}"
         
-        # Подтверждение для больших файлов
         total_volume = sum(len(cols) for cols in self.selected_sheets.values())
-        if total_volume > 100:  # Если больше 100 колонок всего
+        if total_volume > 100:
             response = messagebox.askyesno(
                 "Подтверждение", 
                 f"Будет переведено {total_volume} колонок. Это может занять значительное время. Продолжить?"
@@ -610,7 +659,6 @@ class ExcelTranslatorGUI:
             if not response:
                 return
         
-        # Запускаем в отдельном потоке
         self.stop_translation = False
         self.current_translation_thread = threading.Thread(
             target=self.run_translation,
@@ -619,7 +667,6 @@ class ExcelTranslatorGUI:
         self.current_translation_thread.daemon = True
         self.current_translation_thread.start()
         
-        # Обновляем UI
         self.translate_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
         self.resume_btn.config(state='disabled')
@@ -654,7 +701,6 @@ class ExcelTranslatorGUI:
     def run_translation(self, input_path: str, output_path: str):
         """Запускает процесс перевода (выполняется в отдельном потоке)."""
         try:
-            # Фильтруем выбранные листы (только те, у которых есть выбранные колонки)
             sheets_to_process = {
                 sheet: columns for sheet, columns in self.selected_sheets.items() 
                 if columns
@@ -673,7 +719,16 @@ class ExcelTranslatorGUI:
             )
             
             if success and not self.stop_translation:
-                messagebox.showinfo("Успех", f"Перевод завершен!\nФайл сохранен как:\n{output_path}")
+                final_stats = self.translator.get_translation_stats()
+                stats_msg = (f"Перевод завершен!\n\n"
+                           f"Файл сохранен как:\n{output_path}\n\n"
+                           f"Статистика:\n"
+                           f"• Переведено: {final_stats['translated']}\n"
+                           f"• Из кэша: {final_stats['cached']}\n"
+                           f"• Ошибки: {final_stats['failed']}\n"
+                           f"• Время: {final_stats['elapsed_time']:.1f} сек")
+                
+                messagebox.showinfo("Успех", stats_msg)
                 self.status_var.set("Перевод завершен успешно")
                 logging.info("Перевод завершен успешно")
             elif self.stop_translation:
