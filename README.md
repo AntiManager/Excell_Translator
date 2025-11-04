@@ -16,7 +16,7 @@
 
 1. Скачать файл:
 
-https://github.com/AntiManager/Excell_Translator/releases/download/Latest/ExcellTranslator.exe
+https://github.com/AntiManager/Excell_Translator/releases/latest/download/ExcellTranslator.exe
 
 2. Запустите приложение:
 ```
