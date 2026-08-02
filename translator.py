@@ -16,36 +16,40 @@ from datetime import datetime
 import random
 from requests.exceptions import RequestException
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class RateLimiter:
-    """Класс для контроля частоты запросов к API перевода"""
+    """Класс для контроля частоты запросов к API перевода (потокобезопасный)"""
     
     def __init__(self, max_requests_per_minute: int = 100):
         self.max_requests = max_requests_per_minute
         self.requests = []
+        self._lock = threading.Lock()
     
     def wait_if_needed(self):
         """Ожидает если превышен лимит запросов в минуту"""
-        now = time.time()
-        # Удаляем запросы старше 1 минуты
-        self.requests = [req_time for req_time in self.requests if now - req_time < 60]
-        
-        if len(self.requests) >= self.max_requests:
-            sleep_time = 60 - (now - self.requests[0])
+        while True:
+            with self._lock:
+                now = time.time()
+                self.requests = [req_time for req_time in self.requests if now - req_time < 60]
+                if len(self.requests) < self.max_requests:
+                    self.requests.append(time.time())
+                    return
+                sleep_time = 60 - (now - self.requests[0])
             if sleep_time > 0:
                 logging.info(f"Достигнут лимит запросов. Ожидание {sleep_time:.1f} секунд")
-                time.sleep(sleep_time)
-        
-        self.requests.append(time.time())
+                time.sleep(min(sleep_time, 1.0))
 
 
 class TranslationStateManager:
-    """Менеджер состояния перевода для сохранения и восстановления прогресса"""
+    """Менеджер состояния перевода для сохранения и восстановления прогресса (потокобезопасный)"""
     
     def __init__(self, state_file: str = "translation_state.json"):
         self.state_file = state_file
         self.state = self._load_initial_state()
+        self._lock = threading.Lock()
     
     def _load_initial_state(self) -> Dict:
         """Загружает начальное состояние из файла"""
@@ -127,34 +131,38 @@ class TranslationStateManager:
     
     def add_to_cache(self, original: str, translated: str):
         """Добавляет перевод в кэш"""
-        self.state['translation_cache'][original] = translated
-        # Сохраняем только каждые 50 записей для производительности
-        if len(self.state['translation_cache']) % 50 == 0:
-            self.save_state()
+        with self._lock:
+            self.state['translation_cache'][original] = translated
+            if len(self.state['translation_cache']) % 50 == 0:
+                self.save_state()
     
     def get_from_cache(self, original: str) -> Optional[str]:
         """Получает перевод из кэша"""
-        return self.state['translation_cache'].get(original)
+        with self._lock:
+            return self.state['translation_cache'].get(original)
     
     def mark_failed_translation(self, original: str, error: str):
         """Отмечает неудачный перевод"""
-        self.state['failed_translations'][original] = {
-            'error': error,
-            'timestamp': datetime.now().isoformat()
-        }
+        with self._lock:
+            self.state['failed_translations'][original] = {
+                'error': error,
+                'timestamp': datetime.now().isoformat()
+            }
     
     def get_failed_count(self) -> int:
         """Возвращает количество неудачных переводов"""
-        return len(self.state['failed_translations'])
+        with self._lock:
+            return len(self.state['failed_translations'])
 
 
 class ExcelTranslator:
-    def __init__(self, delay: float = 0.1, max_retries: int = 5, batch_size: int = 50):
+    def __init__(self, delay: float = 0.05, max_retries: int = 5, batch_size: int = 50, workers: int = 5):
         self.translator = GoogleTranslator(source='auto', target='ru')
-        self.rate_limiter = RateLimiter(max_requests_per_minute=80)  # Безопасный лимит
+        self.rate_limiter = RateLimiter(max_requests_per_minute=400)
         self.delay = delay
         self.max_retries = max_retries
         self.batch_size = batch_size
+        self.workers = workers
         self.state_manager = TranslationStateManager()
         self.session_start_time = time.time()
         self.total_requests = 0
@@ -166,6 +174,8 @@ class ExcelTranslator:
             'failed': 0,
             'retries': 0
         }
+        
+        self._lock = threading.Lock()
     
     def _should_translate(self, text: str) -> bool:
         """Проверяет, нужно ли переводить текст"""
@@ -263,26 +273,96 @@ class ExcelTranslator:
         self.stats['failed'] += 1
         return text
     
+    def _translate_single(self, text: str) -> str:
+        """Переводит один текст с повторными попытками (для вызова из пула потоков)."""
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                self.rate_limiter.wait_if_needed()
+                time.sleep(self.delay + random.uniform(0, 0.05))
+
+                translated = self.translator.translate(text)
+                with self._lock:
+                    self.total_requests += 1
+
+                if translated and isinstance(translated, str) and translated.strip():
+                    self.state_manager.add_to_cache(text, translated)
+                    with self._lock:
+                        self.stats['translated'] += 1
+                    return translated
+                else:
+                    raise ValueError("Пустой или некорректный перевод")
+
+            except RequestException as e:
+                last_exception = e
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                logging.warning(f"Сетевая ошибка (попытка {attempt + 1}/{self.max_retries}): {e}")
+                time.sleep(wait_time)
+                with self._lock:
+                    self.stats['retries'] += 1
+            except Exception as e:
+                last_exception = e
+                if "429" in str(e):
+                    wait_time = 30 + random.uniform(0, 10)
+                    logging.warning(f"Превышен лимит запросов. Ожидание {wait_time:.1f} секунд")
+                    time.sleep(wait_time)
+                else:
+                    wait_time = (2 ** attempt) * 0.5 + random.uniform(0, 0.5)
+                    logging.warning(f"Ошибка перевода '{text[:30]}...' (попытка {attempt + 1}/{self.max_retries}): {e}")
+                    time.sleep(wait_time)
+                with self._lock:
+                    self.stats['retries'] += 1
+
+        error_msg = f"Не удалось перевести после {self.max_retries} попыток: {last_exception}"
+        logging.error(f"{error_msg}. Текст: '{text[:50]}...'")
+        self.state_manager.mark_failed_translation(text, error_msg)
+        with self._lock:
+            self.stats['failed'] += 1
+        return text
+
     def translate_batch(self, texts: List[str]) -> List[str]:
-        """Переводит батч текстов, оптимизируя запросы."""
+        """Переводит батч текстов через пул потоков для параллельных запросов."""
         if not texts:
             return []
-        
-        results = []
-        
-        for text in texts:
+
+        results = [None] * len(texts)
+        to_translate = []
+        to_translate_indices = []
+
+        for idx, text in enumerate(texts):
             if not text or not isinstance(text, str):
-                results.append(text)
+                results[idx] = text
                 continue
-                
+            if not self._should_translate(text):
+                results[idx] = text
+                continue
             cached = self.state_manager.get_from_cache(text)
             if cached:
-                results.append(cached)
-                self.stats['cached'] += 1
+                results[idx] = cached
+                with self._lock:
+                    self.stats['cached'] += 1
             else:
-                translated = self.translate_text_with_retry(text)
-                results.append(translated)
-        
+                to_translate.append(text)
+                to_translate_indices.append(idx)
+
+        if to_translate:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                future_map = {
+                    executor.submit(self._translate_single, text): idx
+                    for text, idx in zip(to_translate, to_translate_indices)
+                }
+                for future in as_completed(future_map):
+                    idx = future_map[future]
+                    results[idx] = future.result()
+
+            elapsed = time.time() - self.session_start_time
+            rate = self.total_requests / elapsed if elapsed > 0 else 0
+            logging.info(f"Параллельный запрос: {len(to_translate)} текстов, "
+                        f"всего запросов: {self.total_requests}, "
+                        f"скорость: {rate:.1f} запр/сек, "
+                        f"кэш: {self.stats['cached']}, "
+                        f"ошибки: {self.stats['failed']}")
+
         return results
     
     def get_translation_stats(self) -> Dict[str, Any]:
@@ -329,7 +409,7 @@ class ExcelTranslator:
             total_cells = 0
             
             for col in columns:
-                if col in df.columns and df[col].dtype == 'object':
+                if col in df.columns and (df[col].dtype == 'object' or isinstance(df[col].dtype, pd.StringDtype)):
                     non_empty = df[col].dropna()
                     # Считаем только тексты, которые нужно переводить
                     translatable = non_empty[non_empty.apply(self._should_translate)]
